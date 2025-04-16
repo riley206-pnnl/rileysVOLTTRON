@@ -1,0 +1,15 @@
+{
+    "connection": {
+        "type": "sqlite",
+        "params": {
+            "database": "historian_test.sqlite"
+        }
+    },
+    # When capturing device data only capture topics with AHU (e.g., "devices/CAMPUS/BUILDING/AHU1/all"
+    # When a topic does contain AHU, only store points in the  point list to the database for that topic.
+    "device_data_filter": {
+        "AHU": ["OutdoorAirTemperature"]
+    },
+    "capture_device_data": true,
+    "all_platforms":true
+}

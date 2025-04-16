@@ -1,0 +1,9 @@
+{
+    "connection": {
+        "type": "sqlite",
+        "params": {
+            "url": "sqlite:////home/riley/databases/historian_test.sqlite"
+        }
+    },
+    "all_platforms": true
+}
