@@ -54,9 +54,10 @@ class TNSHistorian2(BaseHistorian):
 
     def __init__(self, connection, **kwargs):
         _log.info("TNSHistorian2 initialization started")
-
         # Save connection info before calling parent constructor
         self.connection = connection
+        # Track which tables we want to automatically store data for
+        self.tracked_tables = set()
 
         # Ensure SQLite connection parameters include a URL if using SQLite
         if self.connection.get("type", "").lower() == "sqlite":
@@ -155,17 +156,13 @@ class TNSHistorian2(BaseHistorian):
         """
         # Anon the topic if necessary
         topic = self.get_renamed_topic(topic)
-
         timestamp_string = headers.get(headers_mod.DATE, None)
         timestamp = utils.get_aware_utc_now()
-
         if timestamp_string is not None:
             timestamp, my_tz = utils.process_timestamp(timestamp_string, topic)
             headers['time_error'] = self.does_time_exceed_tolerance(topic, timestamp)
-
         if sender == 'pubsub.compat':
             message = compat.unpack_legacy_message(headers, message)
-
         if self.gather_timing_data:
             utils.add_timing_data_to_header(headers, self.core.agent_uuid or self.core.identity, "collected")
 
@@ -181,7 +178,7 @@ class TNSHistorian2(BaseHistorian):
                 'headers': headers
             })
         else:
-            # For non-TNS topics, use the default behavior
+            # TODO For non-TNS are doing the same thing for now
             self._event_queue.put({
                 'source': 'record',
                 'topic': topic,
@@ -190,30 +187,181 @@ class TNSHistorian2(BaseHistorian):
                 'headers': headers
             })
 
+    @RPC.export
+    def register_table(self, table_name, table_columns):
+        """
+        RPC method to register a table for automatic storage.
+        Once registered, any data published with this table_name will be stored
+        using the local data manager.
+
+        :param table_name: Name of the table to create and store data in
+        :param table_columns: List of column definitions for the table
+        :return: Dictionary with status information
+        """
+        _log.info(f"Registering table for automatic storage: {table_name}")
+
+        if not table_name:
+            return {"status": "error", "message": "Table name cannot be empty"}
+
+        if not isinstance(table_columns, list):
+            return {"status": "error", "message": "Table columns must be provided as a list"}
+
+        # Check if data manager is initialized
+        if self.data_manager is None:
+            try:
+                _log.info(f"Initializing data manager with params: {self.connection['params']}")
+                self.data_manager = LocalDataManager(
+                    transactive_node=None,
+                    db_params=self.connection["params"]
+                )
+                self.data_manager.init_archive()
+            except Exception as e:
+                _log.error(f"Failed to initialize data manager: {e}")
+                return {"status": "error", "message": f"Data manager initialization failed: {str(e)}"}
+
+        try:
+            # Ensure the table exists in the data manager
+            try:
+                self._ensure_table_exists(table_name, table_columns)
+            except Exception as e:
+                _log.error(f"Error creating table {table_name}: {e}")
+                return {"status": "error", "message": f"Table creation failed: {str(e)}"}
+
+            # Add the table to our tracking set
+            self.tracked_tables.add(table_name)
+
+            _log.info(f"Added table {table_name} to tracked tables")
+            _log.info(f"Current tracked tables (as list): {list(self.tracked_tables)}")
+            _log.info(f"Is {table_name} in tracked tables? {table_name in self.tracked_tables}")
+
+            # Verify data_manager is initialized correctly
+            if self.data_manager:
+                _log.info(f"Data manager orm available: {hasattr(self.data_manager, 'orm')}")
+                if hasattr(self.data_manager, 'orm'):
+                    _log.info(f"Data manager tables: {list(self.data_manager.orm.keys())}")
+
+                    # Check if our table is actually in the orm
+                    if table_name in self.data_manager.orm:
+                        _log.info(f"Table {table_name} successfully found in data manager orm")
+                    else:
+                        _log.warning(f"Table {table_name} NOT found in data manager orm!")
+                else:
+                    _log.warning("Data manager orm attribute not found!")
+
+                # Check connection to database
+                try:
+                    _log.info("Testing data manager connection...")
+                    self.data_manager.engine.connect()
+                    _log.info("Data manager connection test successful")
+                except Exception as e:
+                    _log.error(f"Data manager connection test failed: {e}")
+            else:
+                _log.error("Data manager is not initialized!")
+
+            return {
+                "status": "success",
+                "message": f"Table {table_name} registered for automatic storage",
+                "tracked_tables": list(self.tracked_tables)
+            }
+
+        except Exception as e:
+            _log.error(f"Error registering table: {e}", exc_info=True)
+            return {"status": "error", "message": f"Exception: {str(e)}"}
+
     def publish_to_historian(self, to_publish_list):
         """
         Main publish method for the TNSHistorian2.
-        For TNS records, we don't report them as handled so they stay in the cache.
-
-        :param to_publish_list: List of records to publish
         """
         _log.debug(f"Processing {len(to_publish_list)} records")
-
         if not to_publish_list:
             return
 
         try:
-            # Process each record
-            for record in to_publish_list:
-                _log.debug(f"Publishing record: {record}")
-                # We just log the records but we DON'T call report_all_handled()
-                # This ensures they stay in the cache until transferred via RPC
+            records_to_store = []
+            # Debug the tracked tables at start
+            _log.info(f"Starting publish_to_historian with tracked tables: {self.tracked_tables}")
 
-            # Comment out or remove this line:
-            # self.report_all_handled()
+            for record in to_publish_list:
+                _log.info(f"\nProcessing record: {record}")
+                topic = record.get('topic', '')
+
+                if topic.startswith('TNS/'):
+                    _log.info("Found TNS topic")
+
+                    # Get the value from the readings - this is where the issue is
+                    if 'value' in record:  # Direct access to value if it exists
+                        value = record['value']
+                        _log.info(f"Found value directly in record: {value}")
+                    elif record.get('readings') and len(record['readings']) > 0:
+                        timestamp, value = record['readings'][0]
+                        _log.info(f"Extracted from readings - timestamp: {timestamp}, value: {value}")
+                    else:
+                        _log.warning("No value or readings found in record")
+                        continue
+
+                    if isinstance(value, dict):
+                        table_name = value.get('table_name')
+                        _log.info(f"Found table_name in value: {table_name}")
+                        _log.info(f"Current tracked_tables: {self.tracked_tables}")
+
+                        if table_name and table_name in self.tracked_tables:
+                            _log.info(f"✓ Found matching table {table_name}")
+                            # Get the data portion
+                            data = value.get('data', {}).copy()
+                            if isinstance(data.get('timestamp'), str):
+                                try:
+                                    from datetime import datetime
+                                    import pytz
+                                    dt = datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))
+                                    if dt.tzinfo is None:
+                                        dt = pytz.UTC.localize(dt)
+                                    data['timestamp'] = dt
+                                except ValueError as e:
+                                    _log.error(f"Unable to parse timestamp: {data['timestamp']} - Error: {e}")
+
+                            record_to_store = {
+                                'table_name': table_name,
+                                'data': data
+                            }
+                            _log.info(f"Adding record to store: {record_to_store}")
+                            records_to_store.append(record_to_store)
+                        else:
+                            _log.info(f"✗ Table {table_name} not found in tracked tables")
+                    else:
+                        _log.warning(f"Value is not a dict: {type(value)}")
+                else:
+                    _log.debug(f"Skipping non-TNS topic: {topic}")
+
+            _log.info(f"\nAfter processing all records:")
+            _log.info(f"Records to store count: {len(records_to_store)}")
+
+            if records_to_store:
+                _log.info("Records to store:")
+                for record in records_to_store:
+                    _log.info(f"  {record}")
+
+                try:
+                    _log.info("Calling archive_data...")
+                    self.data_manager.archive_data(records_to_store)
+                    _log.info("Successfully stored records")
+                    self.report_handled(to_publish_list)
+                except Exception as e:
+                    _log.error(f"Error storing records: {e}", exc_info=True)
+            else:
+                _log.info("No records to store")
 
         except Exception as e:
             _log.error(f"Error in publish_to_historian: {e}", exc_info=True)
+
+    @RPC.export
+    def get_tracked_tables(self):
+        """
+        RPC method to get the list of tables that are currently being tracked
+        for automatic storage.
+
+        :return: List of table names
+        """
+        return list(self.tracked_tables)
 
     @RPC.export
     def inspect_cache_database(self):
