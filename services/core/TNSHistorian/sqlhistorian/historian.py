@@ -35,7 +35,7 @@ def historian(config_path, **kwargs):
             "params": {"url": "sqlite:////home/volttron/historian_data.sqlite"}
         },
         "topic_replace_list": [],
-        "custom_topics": {"TNS": ["TNS/"]}  # Ensure we capture TNS topics
+        "custom_topics": {"capture_record_data": ["TNS/"]}  # Correct format
     }
 
     connection = config.get("connection")
@@ -149,44 +149,7 @@ class TNSHistorian2(BaseHistorian):
         except Exception as e:
             _log.error(f"Failed to initialize TENTS data manager: {e}")
 
-    def _capture_record_data(self, peer, sender, bus, topic, headers, message):
-        """
-        Override the _capture_record_data method to properly handle TNS topics.
-        For TNS topics, we store the entire message as the value.
-        """
-        # Anon the topic if necessary
-        topic = self.get_renamed_topic(topic)
-        timestamp_string = headers.get(headers_mod.DATE, None)
-        timestamp = utils.get_aware_utc_now()
-        if timestamp_string is not None:
-            timestamp, my_tz = utils.process_timestamp(timestamp_string, topic)
-            headers['time_error'] = self.does_time_exceed_tolerance(topic, timestamp)
-        if sender == 'pubsub.compat':
-            message = compat.unpack_legacy_message(headers, message)
-        if self.gather_timing_data:
-            utils.add_timing_data_to_header(headers, self.core.agent_uuid or self.core.identity, "collected")
-
-        # For TNS topics, we want to preserve the entire message structure
-        if topic.startswith('TNS/'):
-            _log.debug(f"Processing TNS topic: {topic} with message: {message}")
-            # Put the entire message in the 'value' field to be stored by the base historian
-            self._event_queue.put({
-                'source': 'record',
-                'topic': topic,
-                'readings': [(timestamp, message)],  # Store entire message as value
-                'meta': {},
-                'headers': headers
-            })
-        else:
-            # TODO For non-TNS are doing the same thing for now
-            self._event_queue.put({
-                'source': 'record',
-                'topic': topic,
-                'readings': [(timestamp, message)],
-                'meta': {},
-                'headers': headers
-            })
-
+    # TODO register tables. Handle a list (either 1 or more)
     @RPC.export
     def register_table(self, table_name, table_columns):
         """
@@ -272,6 +235,7 @@ class TNSHistorian2(BaseHistorian):
         """
         Main publish method for the TNSHistorian2.
         """
+        # TODO this is where we are checking table names. Handle non TNS.
         _log.debug(f"Processing {len(to_publish_list)} records")
         if not to_publish_list:
             return
@@ -308,6 +272,7 @@ class TNSHistorian2(BaseHistorian):
                             _log.info(f"✓ Found matching table {table_name}")
                             # Get the data portion
                             data = value.get('data', {}).copy()
+                            # TODO Move to sending side. Assume ISO
                             if isinstance(data.get('timestamp'), str):
                                 try:
                                     from datetime import datetime
@@ -370,6 +335,7 @@ class TNSHistorian2(BaseHistorian):
 
         :return: Dictionary with information about topics and records in the cache
         """
+        # TODO instead of looking at cache look at unknown_table_records
         try:
             # Get path to the cache database
             cache_db_path = self._get_cache_db_path()
