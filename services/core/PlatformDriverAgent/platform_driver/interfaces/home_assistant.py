@@ -21,26 +21,24 @@
 #
 # ===----------------------------------------------------------------------===
 # }}}
-
-
-import random
-from math import pi
-import json
-import sys
-from platform_driver.interfaces import BaseInterface, BaseRegister, BasicRevert
-from volttron.platform.agent import utils
-from volttron.platform.vip.agent import Agent
 import logging
 import requests
-from requests import get
+import json
+import csv
+from io import StringIO
+from platform_driver.interfaces import BaseInterface, BaseRegister, BasicRevert
+from volttron.platform.agent import utils
 
 _log = logging.getLogger(__name__)
-type_mapping = {"string": str,
-                "int": int,
-                "integer": int,
-                "float": float,
-                "bool": bool,
-                "boolean": bool}
+
+type_mapping = {
+    "string": str,
+    "int": int,
+    "integer": int,
+    "float": float,
+    "bool": bool,
+    "boolean": bool
+}
 
 
 class HomeAssistantRegister(BaseRegister):
@@ -54,16 +52,15 @@ class HomeAssistantRegister(BaseRegister):
         self.entity_point = entity_point
 
 
-def _post_method(url, headers, data, operation_description):
+def _post_method(url, headers, data, operation_description, verify=True):
     err = None
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, verify=verify)
         if response.status_code == 200:
             _log.info(f"Success: {operation_description}")
         else:
             err = f"Failed to {operation_description}. Status code: {response.status_code}. " \
                   f"Response: {response.text}"
-
     except requests.RequestException as e:
         err = f"Error when attempting - {operation_description} : {e}"
     if err:
@@ -75,47 +72,76 @@ class Interface(BasicRevert, BaseInterface):
     def __init__(self, **kwargs):
         super(Interface, self).__init__(**kwargs)
         self.point_name = None
-        self.ip_address = None
+        self.url = None
         self.access_token = None
-        self.port = None
         self.units = None
+        self.verify_ssl = True
+        self.ssl_cert_path = None
 
     def configure(self, config_dict, registry_config_str):
-        self.ip_address = config_dict.get("ip_address", None)
-        self.access_token = config_dict.get("access_token", None)
-        self.port = config_dict.get("port", None)
+        _log.debug(f"Configuring Home Assistant driver with config: {config_dict}")
+        self.url = config_dict.get("url")
+        self.access_token = config_dict.get("access_token")
+        self.verify_ssl = config_dict.get("verify_ssl", True)
+        self.ssl_cert_path = config_dict.get("ssl_cert_path")
 
-        # Check for None values
-        if self.ip_address is None:
-            _log.error("IP address is not set.")
-            raise ValueError("IP address is required.")
+        # Check for required parameters
+        if self.url is None:
+            _log.error("URL is not set.")
+            raise ValueError("URL is required.")
         if self.access_token is None:
             _log.error("Access token is not set.")
             raise ValueError("Access token is required.")
-        if self.port is None:
-            _log.error("Port is not set.")
-            raise ValueError("Port is required.")
 
-        self.parse_config(registry_config_str)
+        # Set up the verify option for requests
+        if not self.verify_ssl:
+            import urllib3
+            _log.debug("SSL verification is disabled; suppressing warnings.")
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        self.verify_option = self.ssl_cert_path if self.ssl_cert_path else self.verify_ssl
+
+        _log.info(f"Using Home Assistant URL: {self.url}")
+        _log.debug(f"SSL verification option: {self.verify_option}")
+
+        # Parse the registry configuration
+        if registry_config_str:
+            _log.debug(f"Parsing registry configuration: {type(registry_config_str)}")
+            self.parse_config(registry_config_str)
 
     def get_point(self, point_name):
         register = self.get_register_by_name(point_name)
-
         entity_data = self.get_entity_data(register.entity_id)
-        if register.point_name == "state":
+
+        if register.entity_point == "state":
             result = entity_data.get("state", None)
-            return result
         else:
-            value = entity_data.get("attributes", {}).get(f"{register.point_name}", 0)
-            return value
+            result = entity_data.get("attributes", {}).get(register.entity_point, 0)
+
+        # Apply type conversion if needed
+        if callable(register.reg_type) and not isinstance(result, str):
+            try:
+                result = register.reg_type(result)
+            except (TypeError, ValueError) as e:
+                _log.error(f"Type conversion error for {point_name} with value {result}: {e}")
+                raise
+
+        return result
 
     def _set_point(self, point_name, value):
         register = self.get_register_by_name(point_name)
         if register.read_only:
             raise IOError(
                 "Trying to write to a point configured read only: " + point_name)
-        register.value = register.reg_type(value)  # setting the value
+
+        # Convert the value if needed
+        if callable(register.reg_type):
+            register.value = register.reg_type(value)
+        else:
+            register.value = value
+
         entity_point = register.entity_point
+
         # Changing lights values in home assistant based off of register value.
         if "light." in register.entity_id:
             if entity_point == "state":
@@ -128,7 +154,6 @@ class Interface(BasicRevert, BaseInterface):
                     error_msg = f"State value for {register.entity_id} should be an integer value of 1 or 0"
                     _log.info(error_msg)
                     raise ValueError(error_msg)
-
             elif entity_point == "brightness":
                 if isinstance(register.value, int) and 0 <= register.value <= 255:  # Make sure its int and within range
                     self.change_brightness(register.entity_id, register.value)
@@ -140,7 +165,6 @@ class Interface(BasicRevert, BaseInterface):
                 error_msg = f"Unexpected point_name {point_name} for register {register.entity_id}"
                 _log.error(error_msg)
                 raise ValueError(error_msg)
-
         elif "input_boolean." in register.entity_id:
             if entity_point == "state":
                 if isinstance(register.value, int) and register.value in [0, 1]:
@@ -154,7 +178,6 @@ class Interface(BasicRevert, BaseInterface):
                     raise ValueError(error_msg)
             else:
                 _log.info(f"Currently, input_booleans only support state")
-
         # Changing thermostat values.
         elif "climate." in register.entity_id:
             if entity_point == "state":
@@ -172,8 +195,8 @@ class Interface(BasicRevert, BaseInterface):
                     _log.error(error_msg)
                     raise ValueError(error_msg)
             elif entity_point == "temperature":
-                self.set_thermostat_temperature(entity_id=register.entity_id, temperature=register.value)
-
+                self.set_thermostat_temperature(entity_id=register.entity_id, temperature=register.value,
+                                                units=register.units)
             else:
                 error_msg = f"Currently set_point is supported only for thermostats state and temperature {register.entity_id}"
                 _log.error(error_msg)
@@ -185,18 +208,18 @@ class Interface(BasicRevert, BaseInterface):
             raise ValueError(error_msg)
         return register.value
 
-    def get_entity_data(self, point_name):
+    def get_entity_data(self, entity_id):
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
         }
         # the /states grabs current state AND attributes of a specific entity
-        url = f"http://{self.ip_address}:{self.port}/api/states/{point_name}"
-        response = requests.get(url, headers=headers)
+        url = f"{self.url}/api/states/{entity_id}"
+        response = requests.get(url, headers=headers, verify=self.verify_option)
         if response.status_code == 200:
             return response.json()  # return the json attributes from entity
         else:
-            error_msg = f"Request failed with status code {response.status_code}, Point name: {point_name}, " \
+            error_msg = f"Request failed with status code {response.status_code}, Entity ID: {entity_id}, " \
                         f"response: {response.text}"
             _log.error(error_msg)
             raise Exception(error_msg)
@@ -211,6 +234,7 @@ class Interface(BasicRevert, BaseInterface):
             entity_point = register.entity_point
             try:
                 entity_data = self.get_entity_data(entity_id)  # Using Entity ID to get data
+
                 if "climate." in entity_id:  # handling thermostats.
                     if entity_point == "state":
                         state = entity_data.get("state", None)
@@ -230,16 +254,18 @@ class Interface(BasicRevert, BaseInterface):
                         else:
                             error_msg = f"State {state} from {entity_id} is not yet supported"
                             _log.error(error_msg)
-                            ValueError(error_msg)
+                            raise ValueError(error_msg)
                     # Assigning attributes
                     else:
-                        attribute = entity_data.get("attributes", {}).get(f"{entity_point}", 0)
+                        attribute = entity_data.get("attributes", {}).get(entity_point, 0)
                         register.value = attribute
                         result[register.point_name] = attribute
-                # handling light states
-                elif "light." or "input_boolean." in entity_id: # Checks for lights or input bools since they have the same states.
+
+                # Handle lights and input_boolean (fix logical OR issue)
+                elif "light." in entity_id or "input_boolean." in entity_id:
                     if entity_point == "state":
                         state = entity_data.get("state", None)
+                        _log.debug(f"Fetched state for {entity_id}: {state}")
                         # Converting light states to numbers.
                         if state == "on":
                             register.value = 1
@@ -247,19 +273,21 @@ class Interface(BasicRevert, BaseInterface):
                         elif state == "off":
                             register.value = 0
                             result[register.point_name] = 0
+                        else:
+                            _log.error(f"Unknown state {state} for {entity_id}")
                     else:
-                        attribute = entity_data.get("attributes", {}).get(f"{entity_point}", 0)
+                        attribute = entity_data.get("attributes", {}).get(entity_point, 0)
                         register.value = attribute
                         result[register.point_name] = attribute
+
                 else:  # handling all devices that are not thermostats or light states
                     if entity_point == "state":
-
                         state = entity_data.get("state", None)
                         register.value = state
                         result[register.point_name] = state
                     # Assigning attributes
                     else:
-                        attribute = entity_data.get("attributes", {}).get(f"{entity_point}", 0)
+                        attribute = entity_data.get("attributes", {}).get(entity_point, 0)
                         register.value = attribute
                         result[register.point_name] = attribute
             except Exception as e:
@@ -268,30 +296,56 @@ class Interface(BasicRevert, BaseInterface):
         return result
 
     def parse_config(self, config_dict):
+        """Parse configuration for registers."""
+        _log.debug(f"Parsing config type: {type(config_dict)}")
 
         if config_dict is None:
             return
-        for regDef in config_dict:
 
-            if not regDef['Entity ID']:
+        # If we have a string, try to convert it to a data structure
+        if isinstance(config_dict, str):
+            config_str = config_dict
+
+            try:
+                # Try to parse as JSON first
+                config_dict = json.loads(config_str)
+                _log.debug("Successfully parsed registry config as JSON")
+            except json.JSONDecodeError:
+                # If JSON fails, try CSV format
+                try:
+                    _log.debug("JSON parse failed, trying CSV format")
+                    csv_file = StringIO(config_str)
+                    reader = csv.DictReader(csv_file)
+                    config_dict = list(reader)
+                    _log.debug(f"Successfully parsed registry config as CSV: {len(config_dict)} entries")
+                except Exception as e:
+                    _log.error(f"Failed to parse registry config string: {e}")
+                    config_dict = []
+
+        # Now process the configuration items
+        for regDef in config_dict:
+            # Skip if no Entity ID
+            if 'Entity ID' not in regDef or not regDef['Entity ID']:
+                _log.warning("Skipping register definition without Entity ID")
                 continue
 
             read_only = str(regDef.get('Writable', '')).lower() != 'true'
             entity_id = regDef['Entity ID']
-            entity_point = regDef['Entity Point']
-            self.point_name = regDef['Volttron Point Name']
-            self.units = regDef['Units']
+            entity_point = regDef.get('Entity Point', 'state')
+            point_name = regDef.get('Volttron Point Name', entity_id)
+            units = regDef.get('Units', '')
             description = regDef.get('Notes', '')
-            default_value = ("Starting Value")
+            default_value = regDef.get("Starting Value", None)
             type_name = regDef.get("Type", 'string')
             reg_type = type_mapping.get(type_name, str)
             attributes = regDef.get('Attributes', {})
-            register_type = HomeAssistantRegister
 
-            register = register_type(
+            _log.debug(f"Creating register: {point_name} for entity: {entity_id}")
+
+            register = HomeAssistantRegister(
                 read_only,
-                self.point_name,
-                self.units,
+                point_name,
+                units,
                 reg_type,
                 attributes,
                 entity_id,
@@ -300,12 +354,12 @@ class Interface(BasicRevert, BaseInterface):
                 description=description)
 
             if default_value is not None:
-                self.set_default(self.point_name, register.value)
+                self.set_default(point_name, default_value)
 
             self.insert_register(register)
 
     def turn_off_lights(self, entity_id):
-        url = f"http://{self.ip_address}:{self.port}/api/services/light/turn_off"
+        url = f"{self.url}/api/services/light/turn_off"
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
@@ -313,53 +367,55 @@ class Interface(BasicRevert, BaseInterface):
         payload = {
             "entity_id": entity_id,
         }
-        _post_method(url, headers, payload, f"turn off {entity_id}")
+        _post_method(url, headers, payload, f"turn off {entity_id}", self.verify_option)
 
     def turn_on_lights(self, entity_id):
-        url = f"http://{self.ip_address}:{self.port}/api/services/light/turn_on"
+        url = f"{self.url}/api/services/light/turn_on"
         headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
         }
-
         payload = {
             "entity_id": f"{entity_id}"
         }
-        _post_method(url, headers, payload, f"turn on {entity_id}")
+        _post_method(url, headers, payload, f"turn on {entity_id}", self.verify_option)
 
     def change_thermostat_mode(self, entity_id, mode):
-        # Check if enttiy_id startswith climate.
+        # Check if entity_id startswith climate.
         if not entity_id.startswith("climate."):
             _log.error(f"{entity_id} is not a valid thermostat entity ID.")
             return
+
         # Build header
-        url = f"http://{self.ip_address}:{self.port}/api/services/climate/set_hvac_mode"
-        headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "content-type": "application/json",
-        }
-        # Build data
-        data = {
-            "entity_id": entity_id,
-            "hvac_mode": mode,
-        }
-        # Post data
-        _post_method(url, headers, data, f"change mode of {entity_id} to {mode}")
-
-    def set_thermostat_temperature(self, entity_id, temperature):
-        # Check if the provided entity_id starts with "climate."
-        if not entity_id.startswith("climate."):
-            _log.error(f"{entity_id} is not a valid thermostat entity ID.")
-            return
-
-        url = f"http://{self.ip_address}:{self.port}/api/services/climate/set_temperature"
+        url = f"{self.url}/api/services/climate/set_hvac_mode"
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "content-type": "application/json",
         }
 
-        if self.units == "C":
-            converted_temp = round((temperature - 32) * 5/9, 1)
+        # Build data
+        data = {
+            "entity_id": entity_id,
+            "hvac_mode": mode,
+        }
+
+        # Post data
+        _post_method(url, headers, data, f"change mode of {entity_id} to {mode}", self.verify_option)
+
+    def set_thermostat_temperature(self, entity_id, temperature, units):
+        # Check if the provided entity_id starts with "climate."
+        if not entity_id.startswith("climate."):
+            _log.error(f"{entity_id} is not a valid thermostat entity ID.")
+            return
+
+        url = f"{self.url}/api/services/climate/set_temperature"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "content-type": "application/json",
+        }
+
+        if units == "C":
+            converted_temp = round((temperature - 32) * 5 / 9, 1)
             _log.info(f"Converted temperature {converted_temp}")
             data = {
                 "entity_id": entity_id,
@@ -370,25 +426,25 @@ class Interface(BasicRevert, BaseInterface):
                 "entity_id": entity_id,
                 "temperature": temperature,
             }
-        _post_method(url, headers, data, f"set temperature of {entity_id} to {temperature}")
+
+        _post_method(url, headers, data, f"set temperature of {entity_id} to {temperature}", self.verify_option)
 
     def change_brightness(self, entity_id, value):
-        url = f"http://{self.ip_address}:{self.port}/api/services/light/turn_on"
+        url = f"{self.url}/api/services/light/turn_on"
         headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
         }
         # ranges from 0 - 255
         payload = {
             "entity_id": f"{entity_id}",
             "brightness": value,
         }
-
-        _post_method(url, headers, payload, f"set brightness of {entity_id} to {value}")
+        _post_method(url, headers, payload, f"set brightness of {entity_id} to {value}", self.verify_option)
 
     def set_input_boolean(self, entity_id, state):
         service = 'turn_on' if state == 'on' else 'turn_off'
-        url = f"http://{self.ip_address}:{self.port}/api/services/input_boolean/{service}"
+        url = f"{self.url}/api/services/input_boolean/{service}"
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
@@ -398,10 +454,12 @@ class Interface(BasicRevert, BaseInterface):
             "entity_id": entity_id
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, verify=self.verify_option)
 
-        # Optionally check for a successful response
+        # Check for a successful response
         if response.status_code == 200:
-            print(f"Successfully set {entity_id} to {state}")
+            _log.info(f"Successfully set {entity_id} to {state}")
         else:
-            print(f"Failed to set {entity_id} to {state}: {response.text}")
+            error_msg = f"Failed to set {entity_id} to {state}: {response.text}"
+            _log.error(error_msg)
+            raise Exception(error_msg)
