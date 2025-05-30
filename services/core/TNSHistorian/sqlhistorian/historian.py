@@ -21,8 +21,6 @@ from tent.data_manager.local_data_manager import LocalDataManager
 _log = logging.getLogger(__name__)
 utils.setup_logging()
 
-# TODO Test create tables in bulk
-# TODO ensure schemas are working as intended
 # TODO ensure all topics work with custom topic defined
 # TODO ensure unknown tables are handled. unknown tables?
 
@@ -59,6 +57,7 @@ class TNSHistorian2(BaseHistorian):
         self.connection = connection
         # Track which tables are automatically stored.
         self.tracked_tables = set()
+        self.unknown_table_initialized = False
 
         # Ensure SQLite connection parameters include a URL if using SQLite.
         if self.connection.get("type", "").lower() == "sqlite":
@@ -147,6 +146,25 @@ class TNSHistorian2(BaseHistorian):
         else:
             _log.debug(f"Table {table_name} already exists")
 
+    def _ensure_unknown_table_exists(self):
+        """
+        Ensure the unknown_table_records table exists in the data manager.
+        """
+        if self.unknown_table_initialized:
+            return
+        unknown_table_def = {
+            "name": "unknown_table_records",
+            "columns": [
+                {"name": "id", "type": "Integer", "kwargs": {"primary_key": True, "autoincrement": True}},
+                {"name": "original_table", "type": "String"},
+                {"name": "data", "type": "JSON"},
+                {"name": "timestamp", "type": "DateTime"}
+            ]
+        }
+        self.data_manager.add_tables([unknown_table_def])
+        self.data_manager.init_archive()
+        self.unknown_table_initialized = True
+
     @RPC.export
     def register_table(self, table_name, table_columns):
         """
@@ -207,6 +225,7 @@ class TNSHistorian2(BaseHistorian):
             return
         try:
             records_to_store = []
+            unknown_records_to_store = []
             _log.info(f"Tracked tables: {self.tracked_tables}")
             for record in to_publish_list:
                 _log.info(f"Processing record: {record}")
@@ -236,20 +255,37 @@ class TNSHistorian2(BaseHistorian):
                                     _log.error(f"Timestamp parse error: {data['timestamp']} - {e}")
                             records_to_store.append({'table_name': table_name, 'data': data})
                         else:
-                            _log.info(f"Table {table_name} not tracked")
+                            _log.info(f"Table {table_name} not tracked, storing in unknown_table_records")
+                            self._ensure_unknown_table_exists()
+                            import datetime as dtmod
+                            unknown_data = {
+                                "original_table": table_name or "unknown",
+                                "data": value.get('data', value),
+                                "timestamp": dtmod.datetime.utcnow()
+                            }
+                            unknown_records_to_store.append({'table_name': "unknown_table_records", 'data': unknown_data})
                     else:
                         _log.warning(f"Value is not a dict: {type(value)}")
                 else:
                     _log.debug(f"Skipping non-TNS topic: {topic}")
             _log.info(f"Records to store: {len(records_to_store)}")
+            _log.info(f"Unknown records to store: {len(unknown_records_to_store)}")
             if records_to_store:
                 try:
                     _log.info("Archiving records...")
                     self.data_manager.archive_data(records_to_store)
                     _log.info("Records archived successfully")
-                    self.report_handled(to_publish_list)
                 except Exception as e:
                     _log.error(f"Error storing records: {e}", exc_info=True)
+            if unknown_records_to_store:
+                try:
+                    _log.info("Archiving unknown records...")
+                    self.data_manager.archive_data(unknown_records_to_store)
+                    _log.info("Unknown records archived successfully")
+                except Exception as e:
+                    _log.error(f"Error storing unknown records: {e}", exc_info=True)
+            if records_to_store or unknown_records_to_store:
+                self.report_handled(to_publish_list)
             else:
                 _log.info("No records to store")
         except Exception as e:
