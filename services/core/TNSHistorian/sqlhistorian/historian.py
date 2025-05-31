@@ -21,10 +21,6 @@ from tent.data_manager.local_data_manager import LocalDataManager
 _log = logging.getLogger(__name__)
 utils.setup_logging()
 
-# TODO ensure all topics work with custom topic defined
-# TODO ensure unknown tables are handled. unknown tables?
-
-
 def historian(config_path, **kwargs):
     """
     Parse the config file and initialize the historian with it.
