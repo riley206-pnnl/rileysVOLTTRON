@@ -1,1 +1,0 @@
-{"extensions": {"python.details": {"document_names": {"description": "DESCRIPTION.rst"}}, "python.exports": {"setuptools.installation": {"eggsecutable": "publisher.agent:main"}}}, "extras": [], "generator": "bdist_wheel (0.30.0)", "metadata_version": "2.0", "name": "publisheragent", "run_requires": [{"requires": ["volttron"]}], "summary": "UNKNOWN", "version": "1.0.0"}

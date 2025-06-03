@@ -1,3 +1,0 @@
-[setuptools.installation]
-eggsecutable = publisher.agent:main
-

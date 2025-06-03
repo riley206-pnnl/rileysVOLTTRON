@@ -1,4 +1,0 @@
-[volttron]
-message-bus = zmq
-instance-name = WE47396
-
