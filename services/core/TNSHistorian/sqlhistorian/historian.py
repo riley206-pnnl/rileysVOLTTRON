@@ -17,6 +17,7 @@ from volttron.platform.vip.agent import RPC, compat
 from volttron.platform.agent.base_historian import BaseHistorian
 from volttron.platform.messaging import topics, headers as headers_mod
 from tent.data_manager.local_data_manager import LocalDataManager
+from sqlalchemy.orm import Session
 
 _log = logging.getLogger(__name__)
 utils.setup_logging()
@@ -90,9 +91,9 @@ class TNSHistorian2(BaseHistorian):
         # We pass schema "tns" to LocalDataManager.
         try:
             self.data_manager = LocalDataManager(
-                transactive_node=None,  # Not needed for direct calls.
-                db_params=self.connection["params"],
-                # schema="tns"  # Schema removed from initialization
+                None,  # transactive_node
+                self.connection["params"],
+                100
             )
             _log.info("Successfully created TENTS data manager")
         except Exception as e:
@@ -120,9 +121,9 @@ class TNSHistorian2(BaseHistorian):
         if self.data_manager is None:
             try:
                 self.data_manager = LocalDataManager(
-                    transactive_node=None,
-                    db_params=self.connection["params"],
-                    # schema="tns"  # Schema removed from initialization
+                    None,
+                    self.connection["params"],
+                    100
                 )
             except Exception as e:
                 _log.error(f"Failed to initialize TENTS data manager: {e}")
@@ -148,7 +149,7 @@ class TNSHistorian2(BaseHistorian):
 
     def _ensure_unknown_table_exists(self):
         """
-        Ensure the unknown_table_records table exists in the data manager.
+        Ensure the unknown_table_records table exists in the data manager and the database.
         """
         if self.unknown_table_initialized:
             return
@@ -163,6 +164,8 @@ class TNSHistorian2(BaseHistorian):
         }
         self.data_manager.add_tables([unknown_table_def])
         self.data_manager.init_archive()
+        # Explicitly create the table in the database
+        self.data_manager.registry.metadata.create_all(self.data_manager.engine, checkfirst=True)
         self.unknown_table_initialized = True
 
     @RPC.export
@@ -177,9 +180,9 @@ class TNSHistorian2(BaseHistorian):
             try:
                 _log.info(f"Initializing data manager with params: {self.connection['params']}")
                 self.data_manager = LocalDataManager(
-                    transactive_node=None,
-                    db_params=self.connection["params"],
-                    # schema="tns"  # Schema removed from initialization
+                    None,
+                    self.connection["params"],
+                    100
                 )
                 self.data_manager.init_archive()
             except Exception as e:
@@ -253,6 +256,12 @@ class TNSHistorian2(BaseHistorian):
                                     data['timestamp'] = dt
                                 except ValueError as e:
                                     _log.error(f"Timestamp parse error: {data['timestamp']} - {e}")
+                            # Ensure the table exists before storing
+                            table_columns = [
+                                {"name": k, "type": "String" if isinstance(v, str) else "DateTime" if k == "timestamp" else "JSON"}
+                                for k, v in data.items()
+                            ]
+                            self._ensure_table_exists(table_name, table_columns)
                             records_to_store.append({'table_name': table_name, 'data': data})
                         else:
                             _log.info(f"Table {table_name} not tracked, storing in unknown_table_records")
