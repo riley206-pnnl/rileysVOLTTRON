@@ -58,6 +58,10 @@ class TNSHistorian2(BaseHistorian):
         # Ensure SQLite connection parameters include a URL if using SQLite.
         if self.connection.get("type", "").lower() == "sqlite":
             db_params = self.connection.get("params", {})
+            # NOTE: The URL in the config is preferred. If the directory for the database cannot be created,
+            # or if the URL is missing, a fallback path in the agent's working directory will be used instead.
+            # This ensures the historian always has a writable database location, but may confuse users
+            # if the config URL is not respected due to directory issues.
             if "url" in db_params and db_params["url"].startswith("sqlite:///"):
                 db_path = db_params["url"].replace("sqlite:///", "")
                 if db_path.startswith("/"):
